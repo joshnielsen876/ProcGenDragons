@@ -26,6 +26,16 @@ Then open http://localhost:8000 in desktop Chrome or Edge (WebGPU is required).
 
 `?offscreen` renders into an offscreen texture instead of the page canvas. Automated screenshot checks use it in headless browsers, where presenting a WebGPU canvas is not supported, and read frames back through `window.__lab.capture()`.
 
+## Creature Dive (creatures in Abyssal Garden)
+
+`ocean/` is a copy of [Abyssal Garden](https://github.com/Noniv/abyssal-garden) by Maksymilian Dendura (MIT, see `ocean/LICENSE-abyssal-garden`) with the creature lab's creatures swimming in it. Its own code is unchanged apart from a few hooks:
+
+- `ocean/build.mjs` bundles the creature lab's genome, body and WGSL library into a `LAB` namespace ahead of the world's own files, so the single-file build stays self-contained.
+- `ocean/src/creatures.js` places eighteen seeded creatures (serpents, drakes, rays and jellies) on looping paths near the six viewpoints and draws them in the world's scene pass. They share its camera, depth buffer, sunlight, shadows, caustic ambient light and fog, so they sit in the water like the native mantas and fish.
+- `ocean/src/main.js` calls `setupCreatures`, draws them after the fish, and shows a field-journal readout naming the creature at the centre of view with its rarity and distance.
+
+Build it with `npm install` and `npm run build` inside `ocean/`, then open `ocean/index.html` in desktop Chrome or Edge. Keys 1 to 6 jump between viewpoints.
+
 ## Next steps
 
 1. Tune the creatures until they look striking from every angle, and add more body parts per ecosystem.

@@ -1,13 +1,16 @@
-// WGSL for the creature lab: a backdrop pass and the creature pass.
+// WGSL for creatures: a shared library plus the lab's backdrop and creature passes.
 // Animation is done in the vertex shader from the per-vertex [s, v, part, w] attributes,
 // so a creature costs one draw call no matter how it moves.
 export const UNIFORM_FLOATS = 68; // 2 mat4 + 9 vec4
 
-const common = /* wgsl */ `
+// Shared WGSL used by every renderer that draws creatures: the per-creature uniforms, the
+// animation (crDeform) and the skin (crSurface). Each renderer adds its own camera and lighting.
+// The Abyssal Garden integration binds the same struct at group 1; the lab binds it at group 0.
+export const creatureLib = (group) => /* wgsl */ `
 struct U {
-  vp: mat4x4f,
-  model: mat4x4f,
-  cam: vec4f,      // xyz camera position
+  vp: mat4x4f,     // lab: view-projection. ocean: unused
+  model: mat4x4f,  // lab: model matrix. ocean: path anchor, path shape and size (see ocean/src/creatures.js)
+  cam: vec4f,      // lab: camera position
   back: vec4f,
   belly: vec4f,
   accent: vec4f,
@@ -17,46 +20,35 @@ struct U {
   anim2: vec4f,    // flap speed, tentacle sway, body plan, time
   misc: vec4f,     // glow amount, glow pulse, length, selected
 };
-@group(0) @binding(0) var<uniform> u: U;
+@group(${group}) @binding(0) var<uniform> u: U;
+const CR_TAU = 6.2831853;
 
-fn hash2(p: vec2f) -> vec2f {
+fn crHash2(p: vec2f) -> vec2f {
   let q = vec2f(dot(p, vec2f(127.1, 311.7)), dot(p, vec2f(269.5, 183.3)));
   return fract(sin(q) * 43758.5453);
 }
 // Distance to the nearest cell point; the cells wrap every 'period' cells in y.
-fn cells(p: vec2f, period: f32) -> f32 {
+fn crCells(p: vec2f, period: f32) -> f32 {
   let i = floor(p); let f = fract(p);
   var d = 9.0;
   for (var y = -1; y <= 1; y++) {
     for (var x = -1; x <= 1; x++) {
       let o = vec2f(f32(x), f32(y));
       var c = i + o; c.y = c.y - period * floor(c.y / period);
-      let h = hash2(c);
+      let h = crHash2(c);
       d = min(d, length(o + h * 0.8 + 0.1 - f));
     }
   }
   return d;
 }
-`;
 
-export const creatureWGSL = common + /* wgsl */ `
-struct VI { @location(0) pos: vec3f, @location(1) nrm: vec3f, @location(2) at: vec4f };
-struct VO {
-  @builtin(position) cp: vec4f,
-  @location(0) wp: vec3f,
-  @location(1) n: vec3f,
-  @location(2) at: vec4f,
-  @location(3) ln: vec3f,
-};
-
-const TAU = 6.2831853;
-
-@vertex fn vs(i: VI) -> VO {
-  var p = i.pos;
-  var n = i.nrm;
-  let s = i.at.x; let part = i.at.z; let w = i.at.w;
-  let t = u.anim2.w; let L = u.misc.z; let plan = u.anim2.z;
-
+struct CrV { p: vec3f, n: vec3f };
+// Animates one vertex in the creature's own space (nose toward +z, or bell up for a medusa).
+fn crDeform(pos: vec3f, nrm: vec3f, at: vec4f, t: f32) -> CrV {
+  var p = pos;
+  var n = nrm;
+  let s = at.x; let part = at.z; let w = at.w;
+  let L = u.misc.z; let plan = u.anim2.z;
   if (plan > 2.5) {
     // Medusa: the bell contracts and the trailing parts sway.
     let ph = sin(t * u.anim.z * 2.2);
@@ -67,9 +59,9 @@ const TAU = 6.2831853;
   } else {
     // Swimming: a wave travels from nose to tail.
     let env = select(pow(max(s, 0.0), 1.6), 0.3 + 0.7 * s, plan < 0.5);
-    let phase = TAU * u.anim.y * s - t * u.anim.z * 3.6;
+    let phase = CR_TAU * u.anim.y * s - t * u.anim.z * 3.6;
     p.x += u.anim.x * L * env * sin(phase);
-    let slope = u.anim.x * env * TAU * u.anim.y * cos(phase);
+    let slope = u.anim.x * env * CR_TAU * u.anim.y * cos(phase);
     n = normalize(n + vec3f(0.0, 0.0, n.x * slope * 0.5));
     // Wings and fins flap; the outer edge lags the root.
     if (abs(w) > 0.0 && part > 0.5 && part < 2.5) {
@@ -79,33 +71,23 @@ const TAU = 6.2831853;
   }
   if (part > 2.5 && part < 3.5) {
     // Tentacles, whiskers and lure stalks drift.
-    let ph = p.x * 13.0 + p.y * 7.0;
+    let ph = select(p.x * 13.0 + p.y * 7.0, p.x * 13.0 + p.z * 7.0, plan > 2.5);
     let amp = u.anim2.y * L * pow(w, 1.5);
-    let ph2 = select(ph, p.x * 13.0 + p.z * 7.0, plan > 2.5);
-    p.x += amp * sin(t * 1.7 + w * 5.0 + ph2);
-    let sway = amp * 0.7 * cos(t * 1.3 + w * 4.0 + ph2 * 1.3);
+    p.x += amp * sin(t * 1.7 + w * 5.0 + ph);
+    let sway = amp * 0.7 * cos(t * 1.3 + w * 4.0 + ph * 1.3);
     if (plan > 2.5) { p.z += sway; } else { p.y += sway; }
   }
-  p.y += 0.012 * L * sin(t * 0.9);
-
-  var o: VO;
-  let wp = u.model * vec4f(p, 1.0);
-  o.cp = u.vp * wp;
-  o.wp = wp.xyz;
-  o.n = (u.model * vec4f(n, 0.0)).xyz;
-  o.at = i.at;
-  o.ln = n;
-  return o;
+  return CrV(p, n);
 }
 
-fn patternValue(s: f32, v: f32, part: f32) -> f32 {
+fn crPattern(s: f32, v: f32) -> f32 {
   let kind = u.pat.x; let f = u.pat.y;
   if (kind < 0.5) { // stripes
-    let x = sin(s * 46.0 * f + sin(v * TAU) * 1.2);
+    let x = sin(s * 46.0 * f + sin(v * CR_TAU) * 1.2);
     return smoothstep(0.1, 0.5, x);
   } else if (kind < 1.5) { // spots
     let per = round(7.0 * f);
-    let d = cells(vec2f(s * 40.0 * f, v * per), per);
+    let d = crCells(vec2f(s * 40.0 * f, v * per), per);
     return 1.0 - smoothstep(0.18, 0.3, d);
   } else if (kind < 2.5) { // rings
     let x = fract(s * 14.0 * f);
@@ -113,29 +95,23 @@ fn patternValue(s: f32, v: f32, part: f32) -> f32 {
   }
   // scales
   let per = round(22.0 * f);
-  let d = cells(vec2f(s * 120.0 * f, v * per), per);
+  let d = crCells(vec2f(s * 120.0 * f, v * per), per);
   return smoothstep(0.25, 0.55, d);
 }
 
-@fragment fn fs(i: VO, @builtin(front_facing) ff: bool) -> @location(0) vec4f {
-  let s = i.at.x; let v = i.at.y; let part = i.at.z; let w = i.at.w;
-  let t = u.anim2.w;
-  var N = normalize(i.n + vec3f(0.0, 1e-5, 0.0));
-  var ln = normalize(i.ln + vec3f(0.0, 1e-5, 0.0));
-  if (!ff) { N = -N; ln = -ln; }
-  let V = normalize(u.cam.xyz - i.wp);
-  let Ld = normalize(vec3f(0.25, 1.0, 0.35));
-
-  let belly = u.belly.rgb; let back = u.back.rgb; let accent = u.accent.rgb; let glowC = u.glow.rgb;
-  var col = mix(belly, back, smoothstep(-0.35, 0.45, ln.y));
+struct CrS { col: vec3f, emit: vec3f, spec: f32, trans: f32 };
+// Skin color, glow and material response at one point. ln is the normal in creature space.
+fn crSurface(at: vec4f, ln: vec3f, t: f32) -> CrS {
+  let s = at.x; let v = at.y; let part = at.z; let w = at.w;
+  let back = u.back.rgb; let accent = u.accent.rgb; let glowC = u.glow.rgb;
+  var col = mix(u.belly.rgb, back, smoothstep(-0.35, 0.45, ln.y));
   var emit = vec3f(0.0);
-
+  var spec = 0.3; var trans = 0.0;
   if (part < 0.5) {
-    col = mix(col, accent, patternValue(s, v, part) * u.pat.z);
+    col = mix(col, accent, crPattern(s, v) * u.pat.z);
     // Glowing markings along the flanks, pulsing from head to tail.
     let flank = 1.0 - smoothstep(0.15, 0.55, abs(ln.y));
-    let per = 6.0;
-    let spot = 1.0 - smoothstep(0.12, 0.22, cells(vec2f(s * 34.0, v * per), per));
+    let spot = 1.0 - smoothstep(0.12, 0.22, crCells(vec2f(s * 34.0, v * 6.0), 6.0));
     let pulse = 0.55 + 0.45 * sin(t * u.misc.y * 3.0 - s * 14.0);
     emit += glowC * u.misc.x * flank * spot * pulse * 1.6;
     if (u.anim2.z > 2.5) { // medusa bell rim glow
@@ -148,6 +124,7 @@ fn patternValue(s: f32, v: f32, part: f32) -> f32 {
     col = mix(mix(col, accent, 0.45), back * 0.6, vein * 0.5);
     col = mix(col, accent, u.pat.z * 0.3 * smoothstep(0.6, 1.0, v));
     emit += glowC * u.misc.x * 0.5 * smoothstep(0.8, 1.0, v) * (0.6 + 0.4 * sin(t * 2.0 + s * 20.0));
+    spec = 0.08; trans = 0.6;
   } else if (part < 2.5) {
     col = mix(vec3f(0.82, 0.78, 0.7), accent, 0.25) * mix(1.0, 0.55, v);
   } else if (part < 3.5) {
@@ -156,20 +133,60 @@ fn patternValue(s: f32, v: f32, part: f32) -> f32 {
   } else if (part < 4.5) {
     col = vec3f(0.01);
     emit += glowC * (0.6 + 0.8 * u.misc.x);
+    spec = 0.8;
   } else {
     emit += glowC * (2.2 + 0.8 * sin(t * u.misc.y * 4.0));
+    spec = 0.8;
   }
+  return CrS(col, emit, spec, trans);
+}
+`;
+
+const common = creatureLib(0);
+
+export const creatureWGSL = common + /* wgsl */ `
+struct VI { @location(0) pos: vec3f, @location(1) nrm: vec3f, @location(2) at: vec4f };
+struct VO {
+  @builtin(position) cp: vec4f,
+  @location(0) wp: vec3f,
+  @location(1) n: vec3f,
+  @location(2) at: vec4f,
+  @location(3) ln: vec3f,
+};
+
+@vertex fn vs(i: VI) -> VO {
+  let t = u.anim2.w; let L = u.misc.z;
+  let d = crDeform(i.pos, i.nrm, i.at, t);
+  var p = d.p;
+  p.y += 0.012 * L * sin(t * 0.9);
+  var o: VO;
+  let wp = u.model * vec4f(p, 1.0);
+  o.cp = u.vp * wp;
+  o.wp = wp.xyz;
+  o.n = (u.model * vec4f(d.n, 0.0)).xyz;
+  o.at = i.at;
+  o.ln = d.n;
+  return o;
+}
+
+@fragment fn fs(i: VO, @builtin(front_facing) ff: bool) -> @location(0) vec4f {
+  let t = u.anim2.w; let s = i.at.x;
+  var N = normalize(i.n + vec3f(0.0, 1e-5, 0.0));
+  var ln = normalize(i.ln + vec3f(0.0, 1e-5, 0.0));
+  if (!ff) { N = -N; ln = -ln; }
+  let V = normalize(u.cam.xyz - i.wp);
+  let Ld = normalize(vec3f(0.25, 1.0, 0.35));
+  let m = crSurface(i.at, ln, t);
 
   let diff = max(dot(N, Ld), 0.0);
   let amb = mix(vec3f(0.05, 0.12, 0.2), vec3f(0.22, 0.36, 0.45), 0.5 + 0.5 * N.y);
   let H = normalize(Ld + V);
-  let spec = pow(max(dot(N, H), 0.0), 48.0) * select(select(0.3, 0.08, part > 0.5 && part < 1.5), 0.8, part > 3.5);
+  let spec = pow(max(dot(N, H), 0.0), 48.0) * m.spec;
   let fres = pow(1.0 - max(dot(N, V), 0.0), 3.0);
-  let irid = (0.5 + 0.5 * cos(TAU * (fres * 1.4 + s * 2.0 + vec3f(0.0, 0.33, 0.67)))) * u.pat.w * fres;
-  var trans = vec3f(0.0);
-  if (part > 0.5 && part < 1.5) { trans = col * max(dot(-N, Ld), 0.0) * 0.6; }
+  let irid = (0.5 + 0.5 * cos(CR_TAU * (fres * 1.4 + s * 2.0 + vec3f(0.0, 0.33, 0.67)))) * u.pat.w * fres;
+  let trans = m.col * max(dot(-N, Ld), 0.0) * m.trans;
 
-  var c = col * (diff * vec3f(1.0, 0.97, 0.9) * 0.9 + amb) + trans + spec * vec3f(0.8, 0.9, 1.0) + irid * 0.9 + emit;
+  var c = m.col * (diff * vec3f(1.0, 0.97, 0.9) * 0.9 + amb) + trans + spec * vec3f(0.8, 0.9, 1.0) + irid * 0.9 + m.emit;
   c += vec3f(0.1, 0.35, 0.5) * fres * 0.35;
 
   let dist = length(u.cam.xyz - i.wp);
@@ -198,7 +215,7 @@ struct BO { @builtin(position) cp: vec4f, @location(0) uv: vec2f };
   c += vec3f(0.12, 0.25, 0.28) * shafts * pow(i.uv.y, 2.0) * 0.6;
   // Drifting marine snow
   let g = vec2f(i.uv.x * 30.0, i.uv.y * 30.0 + t * 0.4);
-  let d = cells(g, 1000.0);
+  let d = crCells(g, 1000.0);
   c += vec3f(0.5, 0.6, 0.6) * (1.0 - smoothstep(0.0, 0.05, d)) * 0.25;
   // Selected tile gets a faint warm rim
   let e = min(min(i.uv.x, 1.0 - i.uv.x), min(i.uv.y, 1.0 - i.uv.y));
